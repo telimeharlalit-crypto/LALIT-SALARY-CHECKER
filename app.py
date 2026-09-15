@@ -98,11 +98,12 @@ def parse_pdf(file):
 
             nums = [float(n) for n in re.findall(r'\b\d+(?:\.\d+)?\b', block_text)]
             if basic == 0:
-                pot_b = [n for n in nums if 17700 <= n <= 225000 and (n % 100 == 0)]
+                pot_b = [n for n in nums if 10000 <= n <= 225000 and (n % 100 == 0)]
                 basic = int(pot_b[0]) if pot_b else 0
 
             employees.append({
                 "name": name,
+                "has_rj_id": True,
                 "basic": basic,
                 "da": da,
                 "hra": hra,
@@ -112,6 +113,7 @@ def parse_pdf(file):
                 "nums": nums
             })
     else:
+        # Fallback for schedules / bills without RJ IDs
         lines = [l.strip() for l in full_text.split("\n") if l.strip()]
         for line in lines:
             line_upper = line.upper()
@@ -120,10 +122,12 @@ def parse_pdf(file):
             nums = [float(t) for t in re.findall(r'\b\d+(?:\.\d+)?\b', line)]
             words = [t for t in re.findall(r'[A-Za-z]+', line) if len(t) > 1]
             valid_words = [w for w in words if w.upper() not in ["BASIC", "DA", "HRA", "GPF", "SI", "RGHS", "TOTAL", "NET", "BILL"]]
-            pot_b = [n for n in nums if 17700 <= n <= 225000 and (n % 100 == 0)]
+            has_rj = bool(re.search(r'\bRJ[A-Z]{2}\d+\b', line, re.IGNORECASE))
+            pot_b = [n for n in nums if 10000 <= n <= 225000 and (n % 100 == 0)]
             if valid_words and pot_b:
                 employees.append({
                     "name": " ".join([w.capitalize() for w in valid_words[:3]]),
+                    "has_rj_id": has_rj,
                     "basic": int(pot_b[0]),
                     "da": 0, "hra": 0, "gpf": 0, "si": 0, "rghs": 0,
                     "nums": nums
@@ -152,42 +156,58 @@ if uploaded_file:
     else:
         results = []
         for emp in emp_records:
-            name = emp["name"]
             basic = emp["basic"]
             if basic == 0:
                 continue
 
-            nums = emp["nums"]
-            exp_da = int(round(basic * (da_rate / 100)))
-            exp_hra = int(round(basic * (hra_rate / 100)))
-            min_gpf = get_min_gpf(basic)
-            min_si = get_min_si(basic)
-            min_rghs = get_min_rghs(basic)
+            has_rj_id = emp.get("has_rj_id", False)
+            raw_name = emp["name"]
+            
+            # Agar RJ Employee ID nahi hai toh sirf Name ke aage "संविदा कार्मिक" likhe
+            display_name = raw_name if has_rj_id else f"{raw_name} (संविदा कार्मिक)"
 
-            # Actual amounts
-            actual_da = emp["da"] if emp["da"] > 0 else (int(round(next((n for n in nums if abs(n - exp_da) <= 2), 0))))
-            actual_hra = emp["hra"] if emp["hra"] > 0 else (int(round(next((n for n in nums if abs(n - exp_hra) <= 2 or abs(n - round(basic * 0.09)) <= 2), 0))))
-            actual_gpf = emp["gpf"] if emp["gpf"] > 0 else int(round(next((n for n in nums if n in [1450, 1625, 2100, 2850, 3575, 4200, 4800, 6150, 8900, 10000, 10500] and n >= min_gpf), 0)))
+            nums = emp["nums"]
+            actual_da = emp["da"] if emp["da"] > 0 else (int(round(next((n for n in nums if abs(n - round(basic * (da_rate / 100))) <= 2), 0))))
+            actual_hra = emp["hra"] if emp["hra"] > 0 else (int(round(next((n for n in nums if abs(n - round(basic * (hra_rate / 100))) <= 2 or abs(n - round(basic * 0.09)) <= 2), 0))))
+            actual_gpf = emp["gpf"] if emp["gpf"] > 0 else int(round(next((n for n in nums if n in [1450, 1625, 2100, 2850, 3575, 4200, 4800, 6150, 8900, 10000, 10500]), 0)))
             actual_si = emp["si"] if emp["si"] > 0 else int(round(max([n for n in nums if n in [800, 1200, 2200, 3000, 5000, 7000]] or [0])))
             actual_rghs = emp["rghs"] if emp["rghs"] > 0 else int(round(next((n for n in nums if n in [265, 440, 658, 875]), 0)))
 
-            # Checks
-            da_status = "OK" if abs(actual_da - exp_da) <= 2 else "Mismatch"
-            hra_status = "OK" if (abs(actual_hra - exp_hra) <= 2 or actual_hra > 0) else "Mismatch"
-            gpf_status = "OK" if (actual_gpf > 0 and actual_gpf >= min_gpf) else "Mismatch"
-            
-            if actual_si >= min_si:
-                si_status = "OK"
-            elif actual_si in VALID_SI_STEPS and actual_si > 0:
-                si_status = "OK (Old Slab)"
+            if not has_rj_id:
+                # संविदा कार्मिक: Error check nahi hoga, N/A rahega
+                exp_da = 0
+                exp_hra = 0
+                min_gpf = 0
+                min_si = 0
+                min_rghs = 0
+                da_status = "N/A (संविदा)"
+                hra_status = "N/A (संविदा)"
+                gpf_status = "N/A (संविदा)"
+                si_status = "N/A (संविदा)"
+                rghs_status = "N/A (संविदा)"
             else:
-                si_status = "Mismatch"
+                # Regular Employee: Full Error Verification
+                exp_da = int(round(basic * (da_rate / 100)))
+                exp_hra = int(round(basic * (hra_rate / 100)))
+                min_gpf = get_min_gpf(basic)
+                min_si = get_min_si(basic)
+                min_rghs = get_min_rghs(basic)
 
-            # Purana Rule: Equal ya higher par OK
-            rghs_status = "OK" if (actual_rghs > 0 and actual_rghs >= min_rghs) else "Mismatch"
+                da_status = "OK" if abs(actual_da - exp_da) <= 2 else "Mismatch"
+                hra_status = "OK" if (abs(actual_hra - exp_hra) <= 2 or actual_hra > 0) else "Mismatch"
+                gpf_status = "OK" if (actual_gpf > 0 and actual_gpf >= min_gpf) else "Mismatch"
+
+                if actual_si >= min_si:
+                    si_status = "OK"
+                elif actual_si in VALID_SI_STEPS and actual_si > 0:
+                    si_status = "OK (Old Slab)"
+                else:
+                    si_status = "Mismatch"
+
+                rghs_status = "OK" if (actual_rghs > 0 and actual_rghs >= min_rghs) else "Mismatch"
 
             results.append({
-                "Employee Name": name,
+                "Employee Name": display_name,
                 "Basic Pay": basic,
                 "Exp DA": exp_da,
                 "Actual DA": actual_da,
@@ -211,7 +231,7 @@ if uploaded_file:
 
         def highlight_status(val):
             val_str = str(val)
-            if val_str.startswith("OK"):
+            if val_str.startswith("OK") or val_str.startswith("N/A"):
                 return "background-color: #c8e6c9; color: #1b5e20; font-weight: bold;"
             elif val_str == "Mismatch":
                 return "background-color: #ffcdd2; color: #b71c1c; font-weight: bold;"
@@ -229,11 +249,11 @@ if uploaded_file:
         col1, col2, col3 = st.columns(3)
         total_emp = len(df)
         all_ok = len(df[
-            (df["DA Check"].str.startswith("OK")) & 
-            (df["HRA Check"].str.startswith("OK")) & 
-            (df["GPF Check"].str.startswith("OK")) & 
-            (df["SI Check"].str.startswith("OK")) & 
-            (df["RGHS Check"].str.startswith("OK"))
+            (df["DA Check"].str.contains("OK|N/A")) & 
+            (df["HRA Check"].str.contains("OK|N/A")) & 
+            (df["GPF Check"].str.contains("OK|N/A")) & 
+            (df["SI Check"].str.contains("OK|N/A")) & 
+            (df["RGHS Check"].str.contains("OK|N/A"))
         ])
         mismatch_cnt = total_emp - all_ok
 
