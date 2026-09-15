@@ -1,7 +1,17 @@
 import streamlit as st
-import pdfplumber
 import pandas as pd
 import re
+
+# PDF Text Extraction (pypdf with pdfplumber fallback)
+def extract_pdf_text(file):
+    try:
+        import pypdf
+        reader = pypdf.PdfReader(file)
+        return "\n".join([p.extract_text() or "" for p in reader.pages])
+    except Exception:
+        import pdfplumber
+        with pdfplumber.open(file) as pdf:
+            return "\n".join([p.extract_text() or "" for p in pdf.pages])
 
 # ----------------- SLAB MINIMUM CALCULATIONS -----------------
 def get_min_gpf(basic):
@@ -29,58 +39,84 @@ def get_min_rghs(basic):
     elif basic <= 54000: return 658
     else: return 875
 
-PROBATION_FIXED_PAYS = {17700, 18500, 19700, 20700, 23700}
 VALID_SI_STEPS = {800, 1200, 2200, 3000, 5000, 7000}
 
-# ----------------- IFMS 3.0 & PAYMANAGER PARSER -----------------
+# ----------------- IFMS 3.0 & PAYMANAGER ROBUST PARSER -----------------
 def parse_pdf(file):
-    full_text_pages = []
-    with pdfplumber.open(file) as pdf:
-        for page in pdf.pages:
-            t = page.extract_text()
-            if t:
-                full_text_pages.append(t)
-
-    full_text = "\n".join(full_text_pages)
-    
-    # Check if IFMS 3.0 with RJ Employee IDs
+    full_text = extract_pdf_text(file)
     emp_id_pattern = re.compile(r'(RJ[A-Z]{2}\d{10,14})', re.IGNORECASE)
-    emp_matches = list(emp_id_pattern.finditer(full_text))
+    matches = list(emp_id_pattern.finditer(full_text))
+
+    desig_words = [
+        'PRINCIPAL', 'ASSISTANT', 'OFFICER', 'LECTURER', 'TEACHER', 
+        'SHERISTEDAR', 'CLERK', 'GRADE', 'RESOURCE', 'PERSON', 'EDUCATION',
+        'SENIOR', 'HEADMASTER', 'DRIVER', 'PEON', 'PHYSICAL', 'INSPECTOR'
+    ]
 
     employees = []
 
-    if emp_matches:
-        # IFMS 3.0 Format: Split text cleanly by Employee IDs
-        for idx, match in enumerate(emp_matches):
-            start_pos = match.start()
-            end_pos = emp_matches[idx + 1].start() if idx + 1 < len(emp_matches) else len(full_text)
-            
-            # Context before ID (for Employee Name)
-            pre_text = full_text[max(0, start_pos - 300):start_pos].strip()
-            pre_lines = [l.strip() for l in pre_text.split("\n") if l.strip()]
-            
-            # Find name in previous 3 lines
-            emp_name = "Employee"
-            for pl in reversed(pre_lines[-3:]):
-                pl_clean = re.sub(r'[^A-Za-z\s]', '', pl).strip()
-                words = pl_clean.split()
-                # Ignore table headers and numbers
-                if words and not any(w.upper() in ["NOMINEE", "SR", "NO", "NAME", "BANK", "PAN", "AADHAR", "ST", "INS", "DATE", "BIRTH", "BELT", "EMPLOYEE", "ID", "PAY", "SCALE"] for w in words):
-                    emp_name = " ".join([w.capitalize() for w in words[:4]])
+    if matches:
+        # IFMS 3.0 Format
+        for i, match in enumerate(matches):
+            start = match.start()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(full_text)
+
+            pre_text = full_text[max(0, start - 400):start]
+            lines = [l.strip() for l in pre_text.split('\n') if l.strip()]
+
+            name = "Employee"
+            for line in reversed(lines):
+                if '(' in line or ')' in line:
+                    continue
+                if re.search(r'(\d{4,}|null|Date|Death|Nominee|Grade|Scale|L\d+|GPF)', line, re.IGNORECASE):
+                    continue
+                if any(d in line.upper() for d in desig_words):
+                    continue
+                clean_name = re.sub(r'[^A-Za-z\s]', '', line).strip()
+                if len(clean_name) >= 3 and not any(k in clean_name.upper() for k in ['BASIC', 'PAY', 'NAME', 'DESIG', 'BELT', 'AADHAR', 'PAN', 'BANK', 'TOTAL', 'GROSS', 'NET', 'SR', 'NO']):
+                    name = " ".join([w.capitalize() for w in clean_name.split()])
                     break
 
-            # Block content containing numbers (allowances and deductions)
-            block_text = full_text[start_pos:end_pos]
+            block_text = full_text[start:end]
+
+            # Standard Head Extraction
+            basic_match = re.search(r'Basic\s+100\s+(\d+)', block_text, re.IGNORECASE)
+            basic = int(basic_match.group(1)) if basic_match else 0
+
+            da_match = re.search(r'DA\s+104\s+(\d+)', block_text, re.IGNORECASE)
+            da = int(da_match.group(1)) if da_match else 0
+
+            hra_match = re.search(r'HRA\s+107\s+(\d+)', block_text, re.IGNORECASE)
+            hra = int(hra_match.group(1)) if hra_match else 0
+
+            si_match = re.search(r'SIP\s+217\s+(\d+)', block_text, re.IGNORECASE)
+            si = int(si_match.group(1)) if si_match else 0
+
+            rghs_match = re.search(r'RGHS\s+297\s+(\d+)', block_text, re.IGNORECASE)
+            rghs = int(rghs_match.group(1)) if rghs_match else 0
+
+            gpf_match = re.search(r'GPF(?:\s+2004)?\s+\d+\s+(\d+)', block_text, re.IGNORECASE)
+            gpf = int(gpf_match.group(1)) if gpf_match else 0
+
+            # Fallback for older schedules
             nums = [float(n) for n in re.findall(r'\b\d+(?:\.\d+)?\b', block_text)]
+            if basic == 0:
+                pot_b = [n for n in nums if 17700 <= n <= 225000 and (n % 100 == 0)]
+                basic = int(pot_b[0]) if pot_b else 0
 
             employees.append({
-                "name": emp_name,
-                "numbers": nums
+                "name": name,
+                "basic": basic,
+                "da": da,
+                "hra": hra,
+                "gpf": gpf,
+                "si": si,
+                "rghs": rghs,
+                "nums": nums
             })
     else:
-        # Fallback for PayManager single-line schedules
+        # Fallback for PayManager simple lists
         lines = [l.strip() for l in full_text.split("\n") if l.strip()]
-        current_emp = None
         for line in lines:
             line_upper = line.upper()
             if any(h in line_upper for h in ["SCHEDULE", "TREASURY", "OFFICE OF", "GRAND TOTAL", "ESTABLISHMENT"]):
@@ -88,16 +124,14 @@ def parse_pdf(file):
             nums = [float(t) for t in re.findall(r'\b\d+(?:\.\d+)?\b', line)]
             words = [t for t in re.findall(r'[A-Za-z]+', line) if len(t) > 1]
             valid_words = [w for w in words if w.upper() not in ["BASIC", "DA", "HRA", "GPF", "SI", "RGHS", "TOTAL", "NET", "BILL"]]
-            
-            if valid_words and len(valid_words) >= 1:
-                potential_name = " ".join([w.capitalize() for w in valid_words[:3]])
-                if current_emp:
-                    employees.append(current_emp)
-                current_emp = {"name": potential_name, "numbers": list(nums)}
-            elif current_emp:
-                current_emp["numbers"].extend(nums)
-        if current_emp:
-            employees.append(current_emp)
+            pot_b = [n for n in nums if 17700 <= n <= 225000 and (n % 100 == 0)]
+            if valid_words and pot_b:
+                employees.append({
+                    "name": " ".join([w.capitalize() for w in valid_words[:3]]),
+                    "basic": int(pot_b[0]),
+                    "da": 0, "hra": 0, "gpf": 0, "si": 0, "rghs": 0,
+                    "nums": nums
+                })
 
     return employees
 
@@ -111,8 +145,6 @@ with col_top1:
 with col_top2:
     hra_rate = st.selectbox("HRA Rate (%)", options=[10, 9, 20, 18], index=0)
 
-st.caption("IFMS 3.0 & PayManager Compatible | Single & Multi-word Name Support | Integer Display")
-
 uploaded_file = st.file_uploader("Salary Bill PDF Upload Karein", type=["pdf"])
 
 if uploaded_file:
@@ -125,113 +157,57 @@ if uploaded_file:
         results = []
         for emp in emp_records:
             name = emp["name"]
-            nums = emp["numbers"]
-
-            # Filter valid Basic Pay: multiple of 100 between 17,700 and 2,25,000
-            potential_basics = sorted([n for n in nums if 17700 <= n <= 225000 and (n % 100 == 0)], reverse=True)
-            if not potential_basics:
+            basic = emp["basic"]
+            if basic == 0:
                 continue
 
-            basic = None
-            da = 0
-            hra = 0
-
-            # Match Basic & DA (60%)
-            for b in potential_basics:
-                calc_da = round(b * (da_rate / 100))
-                match_da = next((n for n in nums if abs(n - calc_da) <= 2), None)
-                if match_da is not None:
-                    basic = b
-                    da = int(round(match_da))
-                    break
-
-            if basic is None:
-                basic = potential_basics[0]
-                calc_da = round(basic * (da_rate / 100))
-                da_candidate = next((n for n in nums if abs(n - calc_da) <= 2), 0)
-                da = int(round(da_candidate))
-
-            # Match HRA (10% ya 9%)
+            nums = emp["nums"]
+            exp_da = int(round(basic * (da_rate / 100)))
             exp_hra = int(round(basic * (hra_rate / 100)))
-            hra_candidate = next((n for n in nums if abs(n - exp_hra) <= 2 or abs(n - round(basic * 0.09)) <= 2), None)
-            hra = int(round(hra_candidate)) if hra_candidate is not None else 0
+            min_gpf = get_min_gpf(basic)
+            min_si = get_min_si(basic)
+            min_rghs = get_min_rghs(basic)
 
-            # Check Samvida: only if basic in probation and DA/HRA == 0
-            is_samvida = (da == 0 and hra == 0 and basic in PROBATION_FIXED_PAYS)
+            # DA & HRA
+            actual_da = emp["da"] if emp["da"] > 0 else (int(round(next((n for n in nums if abs(n - exp_da) <= 2), 0))))
+            actual_hra = emp["hra"] if emp["hra"] > 0 else (int(round(next((n for n in nums if abs(n - exp_hra) <= 2 or abs(n - round(basic * 0.09)) <= 2), 0))))
 
-            exp_da = 0 if is_samvida else int(round(basic * (da_rate / 100)))
-            exp_hra_val = 0 if is_samvida else exp_hra
+            # GPF, SI, RGHS
+            actual_gpf = emp["gpf"] if emp["gpf"] > 0 else int(round(next((n for n in nums if n in [1450, 1625, 2100, 2850, 3575, 4200, 4800, 6150, 8900, 10000, 10500] and n >= min_gpf), 0)))
+            actual_si = emp["si"] if emp["si"] > 0 else int(round(max([n for n in nums if n in [800, 1200, 2200, 3000, 5000, 7000]] or [0])))
+            actual_rghs = emp["rghs"] if emp["rghs"] > 0 else int(round(next((n for n in nums if n in [265, 440, 658, 875]), 0)))
 
-            min_gpf = 0 if is_samvida else get_min_gpf(basic)
-            min_si = 0 if is_samvida else get_min_si(basic)
-            min_rghs = 0 if is_samvida else get_min_rghs(basic)
-
-            gross_estimate = basic + da + hra
-            remaining_nums = [n for n in nums if n not in [basic, da, hra] and abs(n - gross_estimate) > 10 and n < 30000]
-
-            # 1. RGHS Match
-            rghs_candidates = [n for n in remaining_nums if n in [265, 440, 658, 875]]
-            act_rghs = int(round(rghs_candidates[0])) if rghs_candidates else 0
-            if act_rghs in remaining_nums:
-                remaining_nums.remove(act_rghs)
-
-            # 2. SI Match
-            si_candidates = [n for n in remaining_nums if n in [800, 1200, 2200, 3000, 5000, 7000]]
-            act_si = int(round(max(si_candidates))) if si_candidates else 0
-            if act_si in remaining_nums:
-                remaining_nums.remove(act_si)
-
-            # 3. GPF Match
-            if is_samvida:
-                act_gpf = 0
+            # Checks
+            da_status = "OK" if abs(actual_da - exp_da) <= 2 else "Mismatch"
+            hra_status = "OK" if (abs(actual_hra - exp_hra) <= 2 or actual_hra > 0) else "Mismatch"
+            gpf_status = "OK" if (actual_gpf > 0 and actual_gpf >= min_gpf) else "Mismatch"
+            
+            if actual_si >= min_si:
+                si_status = "OK"
+            elif actual_si in VALID_SI_STEPS and actual_si > 0:
+                si_status = "OK (Old Slab)"
             else:
-                standard_gpfs = [1450, 1625, 2100, 2850, 3575, 4200, 4800, 6150, 8900, 10500]
-                gpf_exact = [n for n in remaining_nums if n in standard_gpfs and n >= min_gpf]
-                if gpf_exact:
-                    act_gpf = int(round(gpf_exact[0]))
-                else:
-                    gpf_vol = [n for n in remaining_nums if min_gpf <= n <= 25000]
-                    act_gpf = int(round(gpf_vol[0])) if gpf_vol else 0
+                si_status = "Mismatch"
 
-            # ----------------- STATUS CHECKS -----------------
-            if is_samvida:
-                da_status = "OK (संविदा)"
-                hra_status = "OK (संविदा)"
-                gpf_status = "N/A (संविदा)"
-                si_status = "N/A (संविदा)"
-                rghs_status = "OK" if act_rghs in [0, 265, 440, 658, 875] else "Mismatch"
-            else:
-                da_status = "OK" if abs(da - exp_da) <= 2 else ("N/A (Schedule)" if da == 0 else "Mismatch")
-                hra_status = "OK" if abs(hra - exp_hra_val) <= 2 else ("N/A (Schedule)" if hra == 0 else "Mismatch")
-                gpf_status = "OK" if (act_gpf > 0 and act_gpf >= min_gpf) else "Mismatch"
-                
-                if act_si >= min_si:
-                    si_status = "OK"
-                elif act_si in VALID_SI_STEPS and act_si > 0:
-                    si_status = "OK (Old Slab)"
-                else:
-                    si_status = "Mismatch"
-
-                rghs_status = "OK" if (act_rghs > 0 and act_rghs >= min_rghs) else "Mismatch"
+            rghs_status = "OK" if (actual_rghs > 0 and actual_rghs >= min_rghs) else "Mismatch"
 
             results.append({
                 "Employee Name": name,
-                "Basic Pay": int(round(basic)),
-                "Category": "संविदा / Fixed" if is_samvida else "Regular",
+                "Basic Pay": basic,
                 "Exp DA": exp_da,
-                "Actual DA": da,
+                "Actual DA": actual_da,
                 "DA Check": da_status,
-                "Exp HRA": exp_hra_val,
-                "Actual HRA": hra,
+                "Exp HRA": exp_hra,
+                "Actual HRA": actual_hra,
                 "HRA Check": hra_status,
                 "Min GPF": min_gpf,
-                "Actual GPF": act_gpf,
+                "Actual GPF": actual_gpf,
                 "GPF Check": gpf_status,
                 "Min SI": min_si,
-                "Actual SI": act_si,
+                "Actual SI": actual_si,
                 "SI Check": si_status,
                 "Min RGHS": min_rghs,
-                "Actual RGHS": act_rghs,
+                "Actual RGHS": actual_rghs,
                 "RGHS Check": rghs_status
             })
 
@@ -240,7 +216,7 @@ if uploaded_file:
 
         def highlight_status(val):
             val_str = str(val)
-            if val_str.startswith("OK") or val_str.startswith("N/A"):
+            if val_str.startswith("OK"):
                 return "background-color: #c8e6c9; color: #1b5e20; font-weight: bold;"
             elif val_str == "Mismatch":
                 return "background-color: #ffcdd2; color: #b71c1c; font-weight: bold;"
@@ -258,11 +234,11 @@ if uploaded_file:
         col1, col2, col3 = st.columns(3)
         total_emp = len(df)
         all_ok = len(df[
-            (df["DA Check"].str.contains("OK|N/A")) & 
-            (df["HRA Check"].str.contains("OK|N/A")) & 
-            (df["GPF Check"].str.contains("OK|N/A")) & 
-            (df["SI Check"].str.contains("OK|N/A")) & 
-            (df["RGHS Check"].str.contains("OK|N/A"))
+            (df["DA Check"].str.startswith("OK")) & 
+            (df["HRA Check"].str.startswith("OK")) & 
+            (df["GPF Check"].str.startswith("OK")) & 
+            (df["SI Check"].str.startswith("OK")) & 
+            (df["RGHS Check"].str.startswith("OK"))
         ])
         mismatch_cnt = total_emp - all_ok
 
