@@ -33,8 +33,7 @@ def get_min_si(basic):
     elif basic <= 72000: return 3000
     else: return 7000
 
-# RGHS Exact Slab (Same honi chahiye, zyada nahi)
-def get_exact_rghs(basic):
+def get_min_rghs(basic):
     if basic <= 18000: return 265
     elif basic <= 33500: return 440
     elif basic <= 54000: return 658
@@ -163,7 +162,7 @@ if uploaded_file:
             exp_hra = int(round(basic * (hra_rate / 100)))
             min_gpf = get_min_gpf(basic)
             min_si = get_min_si(basic)
-            exact_rghs = get_exact_rghs(basic)
+            min_rghs = get_min_rghs(basic)
 
             # Actual amounts
             actual_da = emp["da"] if emp["da"] > 0 else (int(round(next((n for n in nums if abs(n - exp_da) <= 2), 0))))
@@ -184,8 +183,8 @@ if uploaded_file:
             else:
                 si_status = "Mismatch"
 
-            # RGHS Check: Exact match hona zaroori hai (Na kam, na zyada)
-            rghs_status = "OK" if (actual_rghs == exact_rghs) else "Mismatch"
+            # Purana Rule: Equal ya higher par OK
+            rghs_status = "OK" if (actual_rghs > 0 and actual_rghs >= min_rghs) else "Mismatch"
 
             results.append({
                 "Employee Name": name,
@@ -202,7 +201,7 @@ if uploaded_file:
                 "Min SI": min_si,
                 "Actual SI": actual_si,
                 "SI Check": si_status,
-                "Exact RGHS": exact_rghs,
+                "Min RGHS": min_rghs,
                 "Actual RGHS": actual_rghs,
                 "RGHS Check": rghs_status
             })
