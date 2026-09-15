@@ -29,13 +29,14 @@ def get_min_rghs(basic):
     elif basic <= 54000: return 658
     else: return 875
 
-# ----------------- PARSER & FILTERS -----------------
-DESIGNATIONS = {
-    "TEACHER", "LECTURER", "PRINCIPAL", "LDC", "UDC", "HEADMASTER", 
-    "PEON", "DRIVER", "OFFICER", "CLERK", "ASSISTANT", "SIP", "JJ",
-    "PHYSICAL", "EDUCATION", "GRADE", "III", "II", "I", "ITAX", "LIC",
-    "SIL", "SS", "RRBASIC"
-}
+# ----------------- STRICT JUNK FILTER -----------------
+# Agar line me inme se koi shabd hai toh wo kabhi naya employee nahi ho sakta
+JUNK_PHRASES = [
+    "SCHOOL", "SECONDARY", "HIGHER", "DEATH", "WHERE PAYMENT", "PAYMENT IS",
+    "ESTABLISHMENT", "TREASURY", "OFFICE OF", "GRAND TOTAL", "SCHEDULE", 
+    "BILL SUMMARY", "GOVT", "GOVERNMENT", "DESIGNATION", "STATEMENT", "VICE",
+    "SENIOR SECONDARY", "BLOCK", "PANCHAYAT", "SAMITI", "DISTRICT", "RAJASTHAN"
+]
 
 IGNORE_WORDS = {
     "DETAILED", "ESTABLISHMENT", "OFFICE", "ID", "AMSSOUNT", "AMOUNT", "DEDUCTION", 
@@ -46,19 +47,25 @@ IGNORE_WORDS = {
     "PAY", "DA", "HRA", "GPF", "SI", "RGHS", "NAME", "DESIG", "OF", "THE", "IN", 
     "AT", "FOR", "AND", "TO", "BY", "RJ", "REFERENCE", "REF", "NO", "AUGUST", 
     "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER", "JANUARY", "FEBRUARY", 
-    "MARCH", "APRIL", "MAY", "JUNE", "JULY", "SAB", "2004", "PT", "FIXED"
+    "MARCH", "APRIL", "MAY", "JUNE", "JULY", "SAB", "2004", "PT", "FIXED",
+    "TEACHER", "LECTURER", "PRINCIPAL", "LDC", "UDC", "HEADMASTER", "PEON", 
+    "DRIVER", "OFFICER", "CLERK", "ASSISTANT", "SIP", "JJ", "PHYSICAL", "EDUCATION", 
+    "GRADE", "III", "II", "I", "ITAX", "LIC", "SIL", "SS", "RRBASIC"
 }
 
+PROBATION_FIXED_PAYS = {17700, 18500, 19700, 20700, 23700}
 VALID_SI_STEPS = {800, 1200, 2200, 3000, 5000, 7000}
+
+def is_line_junk(line_upper):
+    return any(p in line_upper for p in JUNK_PHRASES)
 
 def clean_employee_name(tokens):
     cleaned = []
     for t in tokens:
         w = re.sub(r'[^A-Za-z]', '', t).strip()
-        if not w or w.upper() in IGNORE_WORDS or w.upper() in DESIGNATIONS:
+        if not w or w.upper() in IGNORE_WORDS or len(w) <= 1:
             continue
-        if len(w) > 1:
-            cleaned.append(w.capitalize())
+        cleaned.append(w.capitalize())
     return " ".join(cleaned)
 
 def parse_pdf(file):
@@ -79,15 +86,20 @@ def parse_pdf(file):
     for line in lines:
         line_upper = line.upper()
 
-        if any(h in line_upper for h in ["SCHEDULE", "TREASURY", "OFFICE OF", "GRAND TOTAL", "ESTABLISHMENT", "REFERENCE NO", "BILL SUMMARY"]):
-            continue
-
         tokens = line.replace(',', '').split()
         nums = [float(t) for t in tokens if re.match(r'^\d+(\.\d+)?$', t)]
         words = [t for t in tokens if re.match(r'^[A-Za-z\.]+$', t)]
 
+        # Agar line me school ya office heading ka text hai, toh naya karmchari nahi banega
+        if is_line_junk(line_upper):
+            # Ye numbers current karmchari ke hi allowances/deductions hain
+            if current_emp:
+                current_emp["numbers"].extend(nums)
+            continue
+
         potential_name = clean_employee_name(words)
 
+        # Valid Karmchari Name Check (2 ya 3 shabdon ka naam)
         if potential_name and len(potential_name.split()) >= 2:
             if current_emp:
                 employees.append(current_emp)
@@ -113,23 +125,22 @@ with col_top1:
 with col_top2:
     hra_rate = st.selectbox("HRA Rate (%)", options=[10, 9, 20, 18], index=0)
 
-st.caption("Auto-Detect: संविदा कार्मिक (बिना DA/HRA) के डिडक्शन चेक नहीं होंगे | सभी वैल्यूज बिना दशमलव (.0) के हैं")
-
 uploaded_file = st.file_uploader("Salary Bill PDF Upload Karein", type=["pdf"])
 
 if uploaded_file:
-    with st.spinner("PDF process aur match ki ja rahi hai..."):
+    with st.spinner("PDF process aur verify ki ja rahi hai..."):
         emp_records = parse_pdf(uploaded_file)
 
     if not emp_records:
-        st.error("Koi employee record extract nahi hua. Kripya digital PDF upload karein.")
+        st.error("Koi valid employee record extract nahi hua.")
     else:
         results = []
         for emp in emp_records:
             name = emp["name"]
             nums = emp["numbers"]
 
-            potential_basics = sorted([n for n in nums if 10000 <= n <= 225000 and (n % 100 == 0)], reverse=True)
+            # Basic Pay: Multiple of 100 between 17,000 and 2,25,000
+            potential_basics = sorted([n for n in nums if 17000 <= n <= 225000 and (n % 100 == 0)], reverse=True)
             if not potential_basics:
                 continue
 
@@ -137,7 +148,7 @@ if uploaded_file:
             da = 0
             hra = 0
 
-            # Step 1: Regular employee jiska DA = 60% match kare
+            # Match Basic and DA (60%)
             for b in potential_basics:
                 calc_da = round(b * (da_rate / 100))
                 match_da = next((n for n in nums if abs(n - calc_da) <= 2), None)
@@ -152,16 +163,13 @@ if uploaded_file:
                 da_candidate = next((n for n in nums if abs(n - calc_da) <= 2), 0)
                 da = int(round(da_candidate))
 
-            # Step 2: HRA Match (10% ya 9%)
+            # Match HRA (10% ya 9%)
             exp_hra = int(round(basic * (hra_rate / 100)))
             hra_candidate = next((n for n in nums if abs(n - exp_hra) <= 2 or abs(n - round(basic * 0.09)) <= 2), None)
-            if hra_candidate is not None:
-                hra = int(round(hra_candidate))
-            else:
-                hra = 0
+            hra = int(round(hra_candidate)) if hra_candidate is not None else 0
 
-            # Step 3: Check agar Samvida Karmik hai (Jinko DA aur HRA dono nahi de rakha hai)
-            is_samvida = (da == 0 and hra == 0)
+            # Samvida check: Only if basic is strictly in probation slab AND DA/HRA == 0
+            is_samvida = (da == 0 and hra == 0 and basic in PROBATION_FIXED_PAYS)
 
             exp_da = 0 if is_samvida else int(round(basic * (da_rate / 100)))
             exp_hra_val = 0 if is_samvida else exp_hra
@@ -170,23 +178,22 @@ if uploaded_file:
             min_si = 0 if is_samvida else get_min_si(basic)
             min_rghs = 0 if is_samvida else get_min_rghs(basic)
 
-            # Filter remaining numbers (Gross pay filter)
             gross_estimate = basic + da + hra
             remaining_nums = [n for n in nums if n not in [basic, da, hra] and abs(n - gross_estimate) > 10 and n < 30000]
 
-            # RGHS Match
+            # 1. RGHS Match
             rghs_candidates = [n for n in remaining_nums if n in [265, 440, 658, 875]]
             act_rghs = int(round(rghs_candidates[0])) if rghs_candidates else 0
             if act_rghs in remaining_nums:
                 remaining_nums.remove(act_rghs)
 
-            # SI Match
+            # 2. SI Match
             si_candidates = [n for n in remaining_nums if n in [800, 1200, 2200, 3000, 5000, 7000]]
             act_si = int(round(max(si_candidates))) if si_candidates else 0
             if act_si in remaining_nums:
                 remaining_nums.remove(act_si)
 
-            # GPF Match
+            # 3. GPF Match
             if is_samvida:
                 act_gpf = 0
             else:
@@ -198,7 +205,7 @@ if uploaded_file:
                     gpf_vol = [n for n in remaining_nums if min_gpf <= n <= 25000]
                     act_gpf = int(round(gpf_vol[0])) if gpf_vol else 0
 
-            # ----------------- STATUS CHECKS -----------------
+            # Status Checks
             if is_samvida:
                 da_status = "OK (संविदा)"
                 hra_status = "OK (संविदा)"
@@ -206,9 +213,8 @@ if uploaded_file:
                 si_status = "N/A (संविदा)"
                 rghs_status = "OK" if act_rghs in [0, 265, 440, 658, 875] else "Mismatch"
             else:
-                # Regular Checks
-                da_status = "OK" if abs(da - exp_da) <= 2 else "Mismatch"
-                hra_status = "OK" if abs(hra - exp_hra_val) <= 2 or hra > 0 else "Mismatch"
+                da_status = "OK" if abs(da - exp_da) <= 2 else ("N/A (Schedule)" if da == 0 else "Mismatch")
+                hra_status = "OK" if abs(hra - exp_hra_val) <= 2 else ("N/A (Schedule)" if hra == 0 else "Mismatch")
                 gpf_status = "OK" if (act_gpf > 0 and act_gpf >= min_gpf) else "Mismatch"
                 
                 if act_si >= min_si:
@@ -220,7 +226,6 @@ if uploaded_file:
 
                 rghs_status = "OK" if (act_rghs > 0 and act_rghs >= min_rghs) else "Mismatch"
 
-            # Saare numbers bina decimal (.0) ke add karein
             results.append({
                 "Employee Name": name,
                 "Basic Pay": int(round(basic)),
@@ -245,7 +250,6 @@ if uploaded_file:
         df = pd.DataFrame(results)
         df = df.drop_duplicates(subset=["Employee Name", "Basic Pay"]).reset_index(drop=True)
 
-        # Color Highlights (Green for OK/N/A, Red for Mismatch)
         def highlight_status(val):
             val_str = str(val)
             if val_str.startswith("OK") or val_str.startswith("N/A"):
@@ -263,7 +267,6 @@ if uploaded_file:
         st.subheader("👥 Employee Verification Report")
         st.dataframe(styled_df, use_container_width=True)
 
-        # Summary Counters
         col1, col2, col3 = st.columns(3)
         total_emp = len(df)
         all_ok = len(df[
@@ -279,6 +282,5 @@ if uploaded_file:
         col2.metric("Sab Sahi (All OK)", all_ok)
         col3.metric("Mismatch / Check Required", mismatch_cnt)
 
-        # Download CSV Button
         csv = df.to_csv(index=False).encode('utf-8')
         st.download_button("📥 Verified Data Download Karein (CSV)", csv, "salary_verified.csv", "text/csv")
