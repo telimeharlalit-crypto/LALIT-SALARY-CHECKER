@@ -13,7 +13,7 @@ def extract_pdf_text(file):
         with pdfplumber.open(file) as pdf:
             return "\n".join([p.extract_text() or "" for p in pdf.pages])
 
-# ----------------- SLAB MINIMUM CALCULATIONS -----------------
+# ----------------- SLAB CALCULATIONS -----------------
 def get_min_gpf(basic):
     if basic <= 23100: return 1450
     elif basic <= 28500: return 1625
@@ -33,7 +33,8 @@ def get_min_si(basic):
     elif basic <= 72000: return 3000
     else: return 7000
 
-def get_min_rghs(basic):
+# RGHS Exact Slab (Same honi chahiye, zyada nahi)
+def get_exact_rghs(basic):
     if basic <= 18000: return 265
     elif basic <= 33500: return 440
     elif basic <= 54000: return 658
@@ -41,7 +42,7 @@ def get_min_rghs(basic):
 
 VALID_SI_STEPS = {800, 1200, 2200, 3000, 5000, 7000}
 
-# ----------------- IFMS 3.0 & PAYMANAGER ROBUST PARSER -----------------
+# ----------------- PARSER -----------------
 def parse_pdf(file):
     full_text = extract_pdf_text(file)
     emp_id_pattern = re.compile(r'(RJ[A-Z]{2}\d{10,14})', re.IGNORECASE)
@@ -56,7 +57,6 @@ def parse_pdf(file):
     employees = []
 
     if matches:
-        # IFMS 3.0 Format
         for i, match in enumerate(matches):
             start = match.start()
             end = matches[i + 1].start() if i + 1 < len(matches) else len(full_text)
@@ -79,7 +79,6 @@ def parse_pdf(file):
 
             block_text = full_text[start:end]
 
-            # Standard Head Extraction
             basic_match = re.search(r'Basic\s+100\s+(\d+)', block_text, re.IGNORECASE)
             basic = int(basic_match.group(1)) if basic_match else 0
 
@@ -98,7 +97,6 @@ def parse_pdf(file):
             gpf_match = re.search(r'GPF(?:\s+2004)?\s+\d+\s+(\d+)', block_text, re.IGNORECASE)
             gpf = int(gpf_match.group(1)) if gpf_match else 0
 
-            # Fallback for older schedules
             nums = [float(n) for n in re.findall(r'\b\d+(?:\.\d+)?\b', block_text)]
             if basic == 0:
                 pot_b = [n for n in nums if 17700 <= n <= 225000 and (n % 100 == 0)]
@@ -115,7 +113,6 @@ def parse_pdf(file):
                 "nums": nums
             })
     else:
-        # Fallback for PayManager simple lists
         lines = [l.strip() for l in full_text.split("\n") if l.strip()]
         for line in lines:
             line_upper = line.upper()
@@ -166,13 +163,11 @@ if uploaded_file:
             exp_hra = int(round(basic * (hra_rate / 100)))
             min_gpf = get_min_gpf(basic)
             min_si = get_min_si(basic)
-            min_rghs = get_min_rghs(basic)
+            exact_rghs = get_exact_rghs(basic)
 
-            # DA & HRA
+            # Actual amounts
             actual_da = emp["da"] if emp["da"] > 0 else (int(round(next((n for n in nums if abs(n - exp_da) <= 2), 0))))
             actual_hra = emp["hra"] if emp["hra"] > 0 else (int(round(next((n for n in nums if abs(n - exp_hra) <= 2 or abs(n - round(basic * 0.09)) <= 2), 0))))
-
-            # GPF, SI, RGHS
             actual_gpf = emp["gpf"] if emp["gpf"] > 0 else int(round(next((n for n in nums if n in [1450, 1625, 2100, 2850, 3575, 4200, 4800, 6150, 8900, 10000, 10500] and n >= min_gpf), 0)))
             actual_si = emp["si"] if emp["si"] > 0 else int(round(max([n for n in nums if n in [800, 1200, 2200, 3000, 5000, 7000]] or [0])))
             actual_rghs = emp["rghs"] if emp["rghs"] > 0 else int(round(next((n for n in nums if n in [265, 440, 658, 875]), 0)))
@@ -189,7 +184,8 @@ if uploaded_file:
             else:
                 si_status = "Mismatch"
 
-            rghs_status = "OK" if (actual_rghs > 0 and actual_rghs >= min_rghs) else "Mismatch"
+            # RGHS Check: Exact match hona zaroori hai (Na kam, na zyada)
+            rghs_status = "OK" if (actual_rghs == exact_rghs) else "Mismatch"
 
             results.append({
                 "Employee Name": name,
@@ -206,7 +202,7 @@ if uploaded_file:
                 "Min SI": min_si,
                 "Actual SI": actual_si,
                 "SI Check": si_status,
-                "Min RGHS": min_rghs,
+                "Exact RGHS": exact_rghs,
                 "Actual RGHS": actual_rghs,
                 "RGHS Check": rghs_status
             })
