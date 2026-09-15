@@ -29,49 +29,12 @@ def get_min_rghs(basic):
     elif basic <= 54000: return 658
     else: return 875
 
-# ----------------- STRICT JUNK FILTER -----------------
-# Agar line me inme se koi shabd hai toh wo kabhi naya employee nahi ho sakta
-JUNK_PHRASES = [
-    "SCHOOL", "SECONDARY", "HIGHER", "DEATH", "WHERE PAYMENT", "PAYMENT IS",
-    "ESTABLISHMENT", "TREASURY", "OFFICE OF", "GRAND TOTAL", "SCHEDULE", 
-    "BILL SUMMARY", "GOVT", "GOVERNMENT", "DESIGNATION", "STATEMENT", "VICE",
-    "SENIOR SECONDARY", "BLOCK", "PANCHAYAT", "SAMITI", "DISTRICT", "RAJASTHAN"
-]
-
-IGNORE_WORDS = {
-    "DETAILED", "ESTABLISHMENT", "OFFICE", "ID", "AMSSOUNT", "AMOUNT", "DEDUCTION", 
-    "TOTAL", "GOVERNMENT", "RAJASTHAN", "TREASURY", "BILL", "SUMMARY", "GRAND", 
-    "PAGE", "MAJOR", "HEAD", "SUB", "BUDGET", "DDO", "DATE", "INNER", "OUTER", 
-    "SCHEDULE", "TOKEN", "GROSS", "NET", "SIGNATURE", "ACCOUNT", "IFSC", "BRANCH", 
-    "BANK", "PAYMANAGER", "MONTH", "YEAR", "ALLOWANCES", "DEDUCTIONS", "BASIC", 
-    "PAY", "DA", "HRA", "GPF", "SI", "RGHS", "NAME", "DESIG", "OF", "THE", "IN", 
-    "AT", "FOR", "AND", "TO", "BY", "RJ", "REFERENCE", "REF", "NO", "AUGUST", 
-    "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER", "JANUARY", "FEBRUARY", 
-    "MARCH", "APRIL", "MAY", "JUNE", "JULY", "SAB", "2004", "PT", "FIXED",
-    "TEACHER", "LECTURER", "PRINCIPAL", "LDC", "UDC", "HEADMASTER", "PEON", 
-    "DRIVER", "OFFICER", "CLERK", "ASSISTANT", "SIP", "JJ", "PHYSICAL", "EDUCATION", 
-    "GRADE", "III", "II", "I", "ITAX", "LIC", "SIL", "SS", "RRBASIC"
-}
-
 PROBATION_FIXED_PAYS = {17700, 18500, 19700, 20700, 23700}
 VALID_SI_STEPS = {800, 1200, 2200, 3000, 5000, 7000}
 
-def is_line_junk(line_upper):
-    return any(p in line_upper for p in JUNK_PHRASES)
-
-def clean_employee_name(tokens):
-    cleaned = []
-    for t in tokens:
-        w = re.sub(r'[^A-Za-z]', '', t).strip()
-        if not w or w.upper() in IGNORE_WORDS or len(w) <= 1:
-            continue
-        cleaned.append(w.capitalize())
-    return " ".join(cleaned)
-
+# ----------------- IFMS 3.0 & PAYMANAGER PARSER -----------------
 def parse_pdf(file):
-    employees = []
     full_text_pages = []
-
     with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
             t = page.extract_text()
@@ -79,39 +42,62 @@ def parse_pdf(file):
                 full_text_pages.append(t)
 
     full_text = "\n".join(full_text_pages)
-    lines = [l.strip() for l in full_text.split("\n") if l.strip()]
+    
+    # Check if IFMS 3.0 with RJ Employee IDs
+    emp_id_pattern = re.compile(r'(RJ[A-Z]{2}\d{10,14})', re.IGNORECASE)
+    emp_matches = list(emp_id_pattern.finditer(full_text))
 
-    current_emp = None
+    employees = []
 
-    for line in lines:
-        line_upper = line.upper()
+    if emp_matches:
+        # IFMS 3.0 Format: Split text cleanly by Employee IDs
+        for idx, match in enumerate(emp_matches):
+            start_pos = match.start()
+            end_pos = emp_matches[idx + 1].start() if idx + 1 < len(emp_matches) else len(full_text)
+            
+            # Context before ID (for Employee Name)
+            pre_text = full_text[max(0, start_pos - 300):start_pos].strip()
+            pre_lines = [l.strip() for l in pre_text.split("\n") if l.strip()]
+            
+            # Find name in previous 3 lines
+            emp_name = "Employee"
+            for pl in reversed(pre_lines[-3:]):
+                pl_clean = re.sub(r'[^A-Za-z\s]', '', pl).strip()
+                words = pl_clean.split()
+                # Ignore table headers and numbers
+                if words and not any(w.upper() in ["NOMINEE", "SR", "NO", "NAME", "BANK", "PAN", "AADHAR", "ST", "INS", "DATE", "BIRTH", "BELT", "EMPLOYEE", "ID", "PAY", "SCALE"] for w in words):
+                    emp_name = " ".join([w.capitalize() for w in words[:4]])
+                    break
 
-        tokens = line.replace(',', '').split()
-        nums = [float(t) for t in tokens if re.match(r'^\d+(\.\d+)?$', t)]
-        words = [t for t in tokens if re.match(r'^[A-Za-z\.]+$', t)]
+            # Block content containing numbers (allowances and deductions)
+            block_text = full_text[start_pos:end_pos]
+            nums = [float(n) for n in re.findall(r'\b\d+(?:\.\d+)?\b', block_text)]
 
-        # Agar line me school ya office heading ka text hai, toh naya karmchari nahi banega
-        if is_line_junk(line_upper):
-            # Ye numbers current karmchari ke hi allowances/deductions hain
-            if current_emp:
+            employees.append({
+                "name": emp_name,
+                "numbers": nums
+            })
+    else:
+        # Fallback for PayManager single-line schedules
+        lines = [l.strip() for l in full_text.split("\n") if l.strip()]
+        current_emp = None
+        for line in lines:
+            line_upper = line.upper()
+            if any(h in line_upper for h in ["SCHEDULE", "TREASURY", "OFFICE OF", "GRAND TOTAL", "ESTABLISHMENT"]):
+                continue
+            nums = [float(t) for t in re.findall(r'\b\d+(?:\.\d+)?\b', line)]
+            words = [t for t in re.findall(r'[A-Za-z]+', line) if len(t) > 1]
+            valid_words = [w for w in words if w.upper() not in ["BASIC", "DA", "HRA", "GPF", "SI", "RGHS", "TOTAL", "NET", "BILL"]]
+            
+            if valid_words and len(valid_words) >= 1:
+                potential_name = " ".join([w.capitalize() for w in valid_words[:3]])
+                if current_emp:
+                    employees.append(current_emp)
+                current_emp = {"name": potential_name, "numbers": list(nums)}
+            elif current_emp:
                 current_emp["numbers"].extend(nums)
-            continue
-
-        potential_name = clean_employee_name(words)
-
-        # Valid Karmchari Name Check (2 ya 3 shabdon ka naam)
-        if potential_name and len(potential_name.split()) >= 2:
-            if current_emp:
-                employees.append(current_emp)
-            current_emp = {
-                "name": potential_name,
-                "numbers": list(nums)
-            }
-        elif current_emp:
-            current_emp["numbers"].extend(nums)
-
-    if current_emp:
-        employees.append(current_emp)
+        if current_emp:
+            employees.append(current_emp)
 
     return employees
 
@@ -124,6 +110,8 @@ with col_top1:
     da_rate = st.number_input("DA Rate (%)", value=60, min_value=0, max_value=100, step=1)
 with col_top2:
     hra_rate = st.selectbox("HRA Rate (%)", options=[10, 9, 20, 18], index=0)
+
+st.caption("IFMS 3.0 & PayManager Compatible | Single & Multi-word Name Support | Integer Display")
 
 uploaded_file = st.file_uploader("Salary Bill PDF Upload Karein", type=["pdf"])
 
@@ -139,8 +127,8 @@ if uploaded_file:
             name = emp["name"]
             nums = emp["numbers"]
 
-            # Basic Pay: Multiple of 100 between 17,000 and 2,25,000
-            potential_basics = sorted([n for n in nums if 17000 <= n <= 225000 and (n % 100 == 0)], reverse=True)
+            # Filter valid Basic Pay: multiple of 100 between 17,700 and 2,25,000
+            potential_basics = sorted([n for n in nums if 17700 <= n <= 225000 and (n % 100 == 0)], reverse=True)
             if not potential_basics:
                 continue
 
@@ -148,7 +136,7 @@ if uploaded_file:
             da = 0
             hra = 0
 
-            # Match Basic and DA (60%)
+            # Match Basic & DA (60%)
             for b in potential_basics:
                 calc_da = round(b * (da_rate / 100))
                 match_da = next((n for n in nums if abs(n - calc_da) <= 2), None)
@@ -168,7 +156,7 @@ if uploaded_file:
             hra_candidate = next((n for n in nums if abs(n - exp_hra) <= 2 or abs(n - round(basic * 0.09)) <= 2), None)
             hra = int(round(hra_candidate)) if hra_candidate is not None else 0
 
-            # Samvida check: Only if basic is strictly in probation slab AND DA/HRA == 0
+            # Check Samvida: only if basic in probation and DA/HRA == 0
             is_samvida = (da == 0 and hra == 0 and basic in PROBATION_FIXED_PAYS)
 
             exp_da = 0 if is_samvida else int(round(basic * (da_rate / 100)))
@@ -205,7 +193,7 @@ if uploaded_file:
                     gpf_vol = [n for n in remaining_nums if min_gpf <= n <= 25000]
                     act_gpf = int(round(gpf_vol[0])) if gpf_vol else 0
 
-            # Status Checks
+            # ----------------- STATUS CHECKS -----------------
             if is_samvida:
                 da_status = "OK (संविदा)"
                 hra_status = "OK (संविदा)"
